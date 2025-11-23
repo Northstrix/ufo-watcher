@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UFO WATCHER</title>
+    
+    <!-- LIBRARIES -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    
+    <!-- FONTS -->
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+    <!-- THEME -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: { 
+                        title: ['"Orbitron"', 'sans-serif'],
+                        tech: ['"Share Tech Mono"', 'monospace']
+                    },
+                    colors: {
+                        'hud-cyan': '#00f0ff',
+                        'hud-bg': 'rgba(0, 20, 40, 0.8)',
+                    }
+                }
+            }
+        }
+    </script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #020205; color: #00f0ff; user-select: none; }
+        
+        /* CRT VIGNETTE */
+        .vignette {
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+            background: radial-gradient(circle, rgba(0,0,0,0) 60%, rgba(0,0,0,0.9) 100%);
+            pointer-events: none; z-index: 20;
+        }
+        
+        /* ZOOM OVERLAY (Binocular Effect) */
+        .scope-mask {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: radial-gradient(circle, transparent 40%, #000 45%);
+            pointer-events: none; opacity: 0; transition: opacity 0.3s ease;
+            z-index: 10;
+        }
+        .scope-mask.active { opacity: 1; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- HOOK: NUNCHUK INPUT ---
+        const useNunchuk = () => {
+            const [status, setStatus] = useState('DISCONNECTED');
+            const [data, setData] = useState({ jx: 128, jy: 128, ax: 512, ay: 512, c: 0, z: 0 });
+            const ws = useRef(null);
+
+            const connect = (ip) => {
+                if(ws.current) ws.current.close();
+                try {
+                    ws.current = new WebSocket(`ws://${ip}:81`);
+                    ws.current.onopen = () => setStatus('CONNECTED');
+                    ws.current.onclose = () => setStatus('DISCONNECTED');
+                    ws.current.onmessage = (e) => {
+                        try { setData(JSON.parse(e.data)); } catch(err) {}
+                    };
+                } catch(e) { console.error(e); }
+            };
+            return { status, data, connect };
+        };
+
+        // --- GAME ENGINE ---
+        const Game = ({ inputData, onExit, useTilt }) => {
+            const mountRef = useRef(null);
+            const [score, setScore] = useState(0);
+            const [isZoomed, setIsZoomed] = useState(false);
+
+            const inputRef = useRef(inputData);
+            useEffect(() => { inputRef.current = inputData; }, [inputData]);
+
+            useEffect(() => {
+                // 1. SCENE SETUP
+                const scene = new THREE.Scene();
+                scene.background = new THREE.Color(0x020205);
+                
+                // VISIBILITY FIX: Fog starts far away (80) and ends at 160.
+                // This makes the standard view very clear.
+                scene.fog = new THREE.Fog(0x020205, 80, 160);
+
+                const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 300);
+                camera.position.set(0, 5, 12); // Slightly higher/further back
+
+                const renderer = new THREE.WebGLRenderer({ antialias: true });
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                renderer.shadowMap.enabled = true;
+                mountRef.current.appendChild(renderer.domElement);
+
+                // LIGHTING
+                // Global ambient
+                scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+                
+                // Sun/Moon
+                const dirLight = new THREE.DirectionalLight(0xaaccff, 0.8);
+                dirLight.position.set(10, 20, 10);
+                dirLight.castShadow = true;
+                scene.add(dirLight);
+
+                // Hero Light: Dedicated light for the Badger so he is always visible
+                const heroLight = new THREE.SpotLight(0xffffff, 1.5, 20, Math.PI/4, 0.5);
+                heroLight.position.set(0, 10, 0);
+                heroLight.target.position.set(0, 0, 0);
+                scene.add(heroLight);
+                scene.add(heroLight.target);
+
+                // TERRAIN
+                const grid = new THREE.GridHelper(400, 100, 0x00f0ff, 0x111111);
+                grid.position.y = -0.1;
+                scene.add(grid);
+                const floor = new THREE.Mesh(
+                    new THREE.PlaneGeometry(400, 400), 
+                    new THREE.MeshStandardMaterial({ color: 0x050505, roughness: 0.8 })
+                );
+                floor.rotation.x = -Math.PI/2;
+                floor.receiveShadow = true;
+                scene.add(floor);
+
+                // --- ASSET: THE HONEY BADGER (IMPROVED) ---
+                const badger = new THREE.Group();
+                const furMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 1.0 }); // Matte Black
+                const whiteMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 }); // Bright White
+                
+                // Body: Flatter and wider
+                const body = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.9, 3.2), furMat);
+                body.position.y = 0.55; body.castShadow = true;
+                badger.add(body);
+                
+                // The Mantle (White Stripe): Covers head and back
+                const mantle = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.15, 3.3), whiteMat);
+                mantle.position.set(0, 1.05, -0.05);
+                badger.add(mantle);
+
+                // Head: Boxy, low
+                const head = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.9, 1.2), furMat);
+                head.position.set(0, 0.6, 2.0); head.castShadow = true;
+                badger.add(head);
+                
+                // Head Stripe
+                const headStripe = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.15, 1.25), whiteMat);
+                headStripe.position.set(0, 1.06, 2.0);
+                badger.add(headStripe);
+
+                // Snout
+                const snout = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.5, 0.5), furMat);
+                snout.position.set(0, 0.4, 2.7);
+                badger.add(snout);
+
+                // Ears: Small, on sides
+                const earGeo = new THREE.BoxGeometry(0.2, 0.3, 0.1);
+                const earL = new THREE.Mesh(earGeo, furMat); earL.position.set(0.75, 0.9, 1.8);
+                const earR = new THREE.Mesh(earGeo, furMat); earR.position.set(-0.75, 0.9, 1.8);
+                badger.add(earL, earR);
+
+                // Legs: Short and stocky
+                const legGeo = new THREE.CylinderGeometry(0.25, 0.25, 0.6);
+                const l1 = new THREE.Mesh(legGeo, furMat); l1.position.set(0.8, 0.3, 1.2);
+                const l2 = new THREE.Mesh(legGeo, furMat); l2.position.set(-0.8, 0.3, 1.2);
+                const l3 = new THREE.Mesh(legGeo, furMat); l3.position.set(0.8, 0.3, -1.2);
+                const l4 = new THREE.Mesh(legGeo, furMat); l4.position.set(-0.8, 0.3, -1.2);
+                badger.add(l1, l2, l3, l4);
+
+                // WEAPON: Mounted Gatling
+                const gun = new THREE.Group();
+                const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, 4), new THREE.MeshStandardMaterial({ color: 0x444444, metalness: 0.8 }));
+                barrel.rotation.x = Math.PI/2;
+                barrel.position.z = 1;
+                // Muzzle node for spawn point
+                const muzzleNode = new THREE.Object3D();
+                muzzleNode.position.set(0, 0, 2); 
+                barrel.add(muzzleNode);
+                gun.add(barrel);
+                gun.position.set(1.1, 1.1, 0.5); // Right Shoulder
+                badger.add(gun);
+
+                scene.add(badger);
+
+                // --- GAME LOGIC ---
+                const bullets = [];
+                const ufos = [];
+                const particles = [];
+                let lastZ = 0;
+                let frameId;
+                const LIMIT_X = 14;
+
+                const animate = () => {
+                    const input = inputRef.current;
+                    const zooming = input.c === 1;
+
+                    // 1. ZOOM LOGIC (Scope)
+                    // Normal FOV: 60. Zoom FOV: 20.
+                    // Fog doesn't change much because default is already clear.
+                    const targetFov = zooming ? 20 : 60;
+                    camera.fov += (targetFov - camera.fov) * 0.15;
+                    camera.updateProjectionMatrix();
+                    setIsZoomed(zooming);
+
+                    // 2. MOVEMENT
+                    let dx = 0;
+                    if (useTilt) {
+                        // Accel: Center ~512
+                        const deadzone = 40;
+                        if (input.ax > 512 + deadzone) dx = (input.ax - 552) / 150;
+                        if (input.ax < 512 - deadzone) dx = (input.ax - 472) / 150;
+                    } else {
+                        // Joystick
+                        if (input.jx > 150) dx = (input.jx - 150) / 100;
+                        if (input.jx < 100) dx = (input.jx - 100) / 100;
+                    }
+
+                    // Precision aiming: Move slower when zooming
+                    const speed = zooming ? 0.15 : 0.45;
+                    badger.position.x += dx * speed;
+                    badger.position.x = Math.max(-LIMIT_X, Math.min(LIMIT_X, badger.position.x));
+
+                    // Dynamic Camera Follow
+                    const camTargetY = zooming ? 4 : 5;
+                    const camTargetZ = zooming ? 8 : 12;
+                    camera.position.x += (badger.position.x * 0.6 - camera.position.x) * 0.1;
+                    camera.position.y += (camTargetY - camera.position.y) * 0.1;
+                    camera.position.z += (camTargetZ - camera.position.z) * 0.1;
+                    camera.lookAt(badger.position.x * 0.3, 1, -20); // Look ahead
+
+                    // Tilt Animation
+                    badger.rotation.z = -dx * 0.15;
+                    badger.rotation.y = -dx * 0.1;
+
+                    // 3. SHOOTING
+                    if (input.z && !lastZ) {
+                    // Make the rocket larger and use a very bright, always-lit material.
+                    const rGeo = new THREE.CylinderGeometry(0.15, 0.15, 2); // Increased thickness and length
+                    const neonColor = 0x00f0ff; // Neon cyan for visibility
+
+                    // MeshBasicMaterial is always visible, unaffected by lights and fog
+                    const rMat = new THREE.MeshBasicMaterial({
+                        color: 0xffffff
+                    });
+
+                    const rocket = new THREE.Mesh(rGeo, rMat);
+                    rocket.rotation.x = Math.PI / 2;
+
+                    // Optional: add a glowing sprite/comet tail
+                    const glow = new THREE.Sprite(
+                        new THREE.SpriteMaterial({ color:  0xffffff, opacity: 0.95 })
+                    );
+                    glow.scale.set(0.8, 0.8, 1);
+                    glow.position.set(0, 0, -0.8);
+                    rocket.add(glow);
+
+                    // Spawn at muzzle
+                    const vec = new THREE.Vector3();
+                    muzzleNode.getWorldPosition(vec);
+                    rocket.position.copy(vec);
+                    scene.add(rocket);
+                    bullets.push(rocket);
+
+                    badger.position.z += 0.3; // Recoil
+                    }
+
+                    lastZ = input.z;
+                    // Return from recoil
+                    badger.position.z += (0 - badger.position.z) * 0.1;
+
+                    // 4. BULLETS
+                    for(let i=bullets.length-1; i>=0; i--) {
+                        const b = bullets[i];
+                        b.position.z -= 2.5; // High velocity
+                        
+                        let hit = false;
+                        for(let u=ufos.length-1; u>=0; u--) {
+                            if(b.position.distanceTo(ufos[u].position) < 3.0) {
+                                createExplosion(ufos[u].position, scene, particles);
+                                scene.remove(ufos[u]);
+                                ufos.splice(u, 1);
+                                setScore(s => s + 100);
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if(hit || b.position.z < -200) {
+                            scene.remove(b);
+                            bullets.splice(i, 1);
+                        }
+                    }
+
+                    // 5. UFO SPAWNING & MOVEMENT
+                    if(Math.random() < 0.025) {
+                        spawnUfo(scene, ufos, LIMIT_X);
+                    }
+                    ufos.forEach((u, i) => {
+                        u.position.z += 0.4; // Speed
+                        u.rotation.y += 0.05;
+                        u.position.y = 3 + Math.sin(Date.now() * 0.003 + u.id) * 1.5;
+                        if(u.position.z > 5) {
+                            scene.remove(u);
+                            ufos.splice(i, 1);
+                        }
+                    });
+
+                    // 6. PARTICLES
+                    updateParticles(particles, scene);
+
+                    renderer.render(scene, camera);
+                    frameId = requestAnimationFrame(animate);
+                };
+
+                animate();
+
+                // Cleanup
+                return () => {
+                    cancelAnimationFrame(frameId);
+                    if(mountRef.current) mountRef.current.innerHTML = '';
+                };
+            }, [useTilt]);
+
+            return (
+                <div className="absolute w-full h-full">
+                    <div ref={mountRef} className="w-full h-full" />
+                    
+                    {/* UI LAYERS */}
+                    <div className="vignette"></div>
+                    <div className={`scope-mask ${isZoomed ? 'active' : ''}`}></div>
+
+                    {/* HUD */}
+                    <div className="absolute top-0 left-0 p-6 w-full flex justify-between pointer-events-none z-30">
+                        <div>
+                            <h1 className="text-4xl font-title text-hud-cyan tracking-widest drop-shadow-[0_0_10px_rgba(0,240,255,0.8)]">
+                                UFO WATCHER
+                            </h1>
+                            <div className="flex items-center gap-4 mt-2">
+                                <div className="text-xl font-tech text-white">SCORE: {score}</div>
+                                {isZoomed && <div className="text-red-500 font-tech animate-pulse font-bold">SCOPE ACTIVE</div>}
+                            </div>
+                        </div>
+                        <div className="text-right">
+                            <div className="bg-hud-bg border border-hud-cyan px-4 py-2">
+                                <div className="text-xs text-gray-400 font-tech">INPUT SYSTEM</div>
+                                <div className="text-xl text-hud-cyan font-title">{useTilt ? "ACCELEROMETER" : "JOYSTICK"}</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <button onClick={onExit} className="absolute bottom-6 right-6 z-40 bg-red-900/50 border border-red-500 text-red-100 px-6 py-2 font-title hover:bg-red-600 transition">
+                        ABORT
+                    </button>
+                </div>
+            );
+        };
+
+        // --- HELPERS ---
+        function spawnUfo(scene, list, limitX) {
+            const group = new THREE.Group();
+            
+            // Random Neon Color
+            const colors = [0xff00ff, 0x00ff00, 0x00ffff, 0xffff00];
+            const col = colors[Math.floor(Math.random()*colors.length)];
+
+            // Emissive Material to make them GLOW even in fog
+            const glowMat = new THREE.MeshBasicMaterial({ color: col });
+            const darkMat = new THREE.MeshPhongMaterial({ color: 0x222222 });
+
+            const ring = new THREE.Mesh(new THREE.TorusGeometry(1.5, 0.3, 8, 24), darkMat);
+            ring.rotation.x = Math.PI/2;
+            
+            const lights = new THREE.Group();
+            const l1 = new THREE.Mesh(new THREE.SphereGeometry(0.3), glowMat); l1.position.x = 1.5;
+            const l2 = new THREE.Mesh(new THREE.SphereGeometry(0.3), glowMat); l2.position.x = -1.5;
+            const l3 = new THREE.Mesh(new THREE.SphereGeometry(0.3), glowMat); l3.position.z = 1.5;
+            const l4 = new THREE.Mesh(new THREE.SphereGeometry(0.3), glowMat); l4.position.z = -1.5;
+            const dome = new THREE.Mesh(new THREE.SphereGeometry(0.8), glowMat);
+            
+            group.add(ring, l1, l2, l3, l4, dome);
+
+            // Spawn Logic
+            const xPos = (Math.random() * (limitX * 1.8)) - (limitX * 0.9);
+            group.position.set(xPos, 2, -150); // Far spawn, but visible
+            
+            scene.add(group);
+            list.push(group);
+        }
+
+        function createExplosion(pos, scene, list) {
+            for(let i=0; i<12; i++) {
+                const p = new THREE.Mesh(
+                    new THREE.BoxGeometry(0.4, 0.4, 0.4),
+                    new THREE.MeshBasicMaterial({ color: 0xffaa00 })
+                );
+                p.position.copy(pos);
+                p.userData.vel = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).multiplyScalar(1.2);
+                scene.add(p);
+                list.push(p);
+            }
+        }
+
+        function updateParticles(list, scene) {
+            for(let i=list.length-1; i>=0; i--) {
+                const p = list[i];
+                p.position.add(p.userData.vel);
+                p.rotation.x += 0.1;
+                p.scale.multiplyScalar(0.92);
+                if(p.scale.x < 0.05) {
+                    scene.remove(p);
+                    list.splice(i, 1);
+                }
+            }
+        }
+
+        // --- MAIN MENU ---
+        const App = () => {
+            const { status, connect, data } = useNunchuk();
+            const [mode, setMode] = useState('MENU');
+            const [ip, setIp] = useState('192.168.1.100');
+            const [useTilt, setUseTilt] = useState(true);
+
+            if(mode === 'GAME') return <Game inputData={data} useTilt={useTilt} onExit={()=>setMode('MENU')} />;
+
+            return (
+                <div className="flex flex-col items-center justify-center w-screen h-screen bg-black text-hud-cyan font-tech relative overflow-hidden">
+                    {/* Background Grid Animation */}
+                    <div className="absolute inset-0 z-0 opacity-20" 
+                         style={{backgroundImage: 'linear-gradient(#00f0ff 1px, transparent 1px), linear-gradient(90deg, #00f0ff 1px, transparent 1px)', backgroundSize: '40px 40px'}}>
+                    </div>
+
+                    <div className="z-10 bg-gray-900/90 border-2 border-hud-cyan p-10 max-w-md w-full shadow-[0_0_50px_rgba(0,240,255,0.3)] backdrop-blur">
+                        <h1 className="text-5xl font-title text-center mb-2 text-white drop-shadow-md">UFO WATCHER</h1>
+                        <p className="text-center text-sm text-gray-400 mb-8 tracking-[0.3em]">REMOTE LINK SYSTEM</p>
+                        
+                        <div className="space-y-6">
+                            <div className="flex justify-between items-center border-b border-gray-700 pb-2">
+                                <span>SYSTEM STATUS</span>
+                                <span className={status === 'CONNECTED' ? 'text-green-400 font-bold' : 'text-red-500 font-bold animate-pulse'}>{status}</span>
+                            </div>
+
+                            <div className="space-y-2">
+                                <label className="text-xs text-gray-500">TARGET IP</label>
+                                <div className="flex gap-2">
+                                    <input value={ip} onChange={e=>setIp(e.target.value)} className="bg-black border border-gray-600 p-2 flex-1 text-hud-cyan outline-none focus:border-hud-cyan" />
+                                    <button onClick={()=>connect(ip)} className="bg-gray-800 hover:bg-hud-cyan hover:text-black px-4 font-bold transition">LINK</button>
+                                </div>
+                            </div>
+
+                            <div className="space-y-2">
+                                <label className="text-xs text-gray-500">CONTROL MODE</label>
+                                <div className="flex bg-black border border-gray-600">
+                                    <button onClick={()=>setUseTilt(true)} className={`flex-1 py-3 transition ${useTilt?'bg-hud-cyan text-black font-bold':'text-gray-500 hover:text-white'}`}>TILT</button>
+                                    <button onClick={()=>setUseTilt(false)} className={`flex-1 py-3 transition ${!useTilt?'bg-hud-cyan text-black font-bold':'text-gray-500 hover:text-white'}`}>STICK</button>
+                                </div>
+                            </div>
+
+                            <button onClick={()=>setMode('GAME')} className="w-full bg-white text-black font-title text-2xl py-4 hover:bg-hud-cyan hover:scale-[1.02] transition shadow-lg mt-4">
+                                START MISSION
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
